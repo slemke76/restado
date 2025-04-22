@@ -1,9 +1,20 @@
 <?php
 /**
- * Created by PhpStorm.
- * User: n0impossible
- * Date: 6/13/15
- * Time: 11:35 AM
+ * API for Tado v2/v3 and Tado-X
+ * based on https://github.com/robertogallea/restado
+ *
+ * @copyright Copyright (c) Sebastian Lemke
+ *
+ * Changes:
+ * - added Tado-X Support
+ * - implemented device_code auth (needed started in March 2025) by tado
+ *
+ * Breaking changes:
+ * - results are arrays not objects anymore
+ *   Guzzle is not being used any more directly, it´s better to let the OAuth2-Client library handle this!
+ *
+ * @todo:
+ * - impement 'access_token' as class variable?
  */
 
 namespace Robertogallea\Restado;
@@ -16,7 +27,34 @@ use League\OAuth2\Client\Provider\GenericProvider;
  */
 class Restado {
 
-    protected $home_id;
+    protected $home_id = [];        // @todo: rename to homeId
+    protected $isGenerationX = [];
+
+    /**
+     * Get OAuth2-Client Provider
+     *
+     * @return GenericProvider
+     */
+    private function getProvider() {
+
+        if (config('tado.timeout') !== NULL) {
+          $timeout = config('tado.timeout');
+        } else {
+          // set a timeout based on PHP max_execution_time if not configured
+          // in case of an invalid max_execution_time (empty or FALSE) a default of 20s is being set
+          // in case of an valid max_execution_time the timeout is being set to 90% of this value with a maximum of 20s
+          $timeout = floor((int)ini_get('max_execution_time') * 0.9);
+          if (($timeout>20) or ($timeout<=0)) $timeout = 20;
+        }
+
+        return new GenericProvider([
+            'clientId'                => config('tado.clientId'),    // The client ID assigned to you by the provider
+            'urlAuthorize'            => 'https://login.tado.com/oauth2/device_authorize',
+            'urlAccessToken'          => 'https://login.tado.com/oauth2/token',
+            'urlResourceOwnerDetails' => null,
+            'timeout'                 => $timeout,
+        ]);
+    }
 
     /**
      * Get a Verification Url
@@ -54,6 +92,8 @@ class Restado {
     }
 
     /**
+     * Authorize with device_code against Tado
+     *
      * @param array $data
      * @return \League\OAuth2\Client\Token\AccessToken
      */
@@ -71,12 +111,20 @@ class Restado {
 
         } catch (\League\OAuth2\Client\Provider\Exception\IdentityProviderException $e) {
 
-            // Failed to get the access token
-            exit($e->getMessage());
+            // @todo:
+            // - instead of exit throw an exception at all exit() functions.
+            // - make a own Exception Class < also change in index.php
+            throw new \Exception($e->getMessage());
 
         }
     }
 
+    /**
+     * Get a new token with the refresh token
+     *
+     * @param array $data
+     * @return \League\OAuth2\Client\Token\AccessToken
+     */
     public function refreshToken($data) {
         $provider = $this->getProvider();
 
@@ -98,46 +146,56 @@ class Restado {
     }
 
     /**
+     * Start of Tado - API
+     */
+
+    /**
+     * get information about me
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
      * @param $access_token
      * @return mixed
      */
     public function me($access_token) {
+
         $provider = $this->getProvider();
 
         $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/me',
+            'GET', 'https://my.tado.com/api/v2/me',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+
+        $response = $provider->getParsedResponse($request);
+
+        // store homeid (so getHomeId does not an extra request)
+        $this->home_id[$access_token] = $response['homes'][0]['id'];
+
+        return $response;
     }
 
     /**
-     * @return mixed
+     * get first home id (by calling ->me)
+     * actually Tado supports only one home per login
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @return int
      */
     public function getHomeId($access_token) {
 
-        // do caching....
-        if (isset($this->home_id)) return $this->home_id;
-
-        $provider = $this->getProvider();
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/me',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        $decoded = json_decode($response->getBody());
-
-        $this->home_id = $decoded->homes[0]->id;
-        return $this->home_id;
+        if (!isset($this->home_id[$access_token])) $this->me($access_token);
+        return $this->home_id[$access_token];
     }
 
     /**
+     * get information about my home
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
      * @param $access_token
      * @return mixed
      */
@@ -150,12 +208,231 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id,
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+
+        $response = $provider->getParsedResponse($request);
+
+        // save generation for ->getGenerationX
+         if ($response['generation'] == 'LINE_X') $this->isGenerationX[$access_token] = TRUE;
+        else $this->isGenerationX[$access_token] = FALSE;
+
+        return $response;
     }
 
     /**
+     * get weather report
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @return mixed
+     */
+    public function getHomeWeather($access_token) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest(
+            'GET',
+            'https://my.tado.com/api/v2/homes/' . $home_id . '/weather/',
+            $access_token
+        );
+
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * is it a Tado-X Installation?
+     *
+     * @param $access_token
+     * @return boolean
+     */
+    public function getGenerationX($access_token) {
+
+      if (!isset($this->isGenerationX[$access_token])) $this->getHome($access_token);
+      return $this->isGenerationX[$access_token];
+    }
+
+
+    /**
+     * get home devices
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @return mixed
+     */
+    public function getHomeDevices($access_token) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest('GET',
+                      ($this->getGenerationX($access_token)  ? 'https://hops.tado.com/homes/' . $home_id . '/roomsAndDevices'
+                                                            : 'https://my.tado.com/api/v2/homes/' . $home_id . '/devices/'),
+                      $access_token);
+
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * Response only contains AC installations; will be empty when there are no ACs in the home.
+     *
+     * supported by:   [X] Tado
+     *                 [?] Tado-X - it should be supported (https://github.com/gedhi/tadox-postman-collection?tab=readme-ov-file#get-installations)
+     *                             Feedback is welcome
+     *
+     * @param $access_token
+     * @return mixed
+     */
+    public function getHomeInstallations($access_token) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest(
+            'GET',
+            'https://my.tado.com/api/v2/homes/' . $home_id . '/installations/',
+            $access_token
+        );
+
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * Get all zones (a.k.a. rooms) associated with the provided homeId.
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @return mixed
+     */
+    public function getHomeZones($access_token) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest('GET',
+                      ($this->getGenerationX($access_token)  ? 'https://hops.tado.com/homes/' . $home_id . '/rooms'
+                                                            : 'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/'),
+                      $access_token);
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * Get the current state details of a zone (a.k.a. room).
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @param $zone_id
+     * @return mixed
+     */
+    public function getHomeZoneState($access_token, $zone_id) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest('GET',
+                      ($this->getGenerationX($access_token)  ? 'https://hops.tado.com/homes/' . $home_id . '/rooms/' . $zone_id
+                                                            : 'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/state'),
+                      $access_token);
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * Configure the zone overlay (manual override of the configured schedule) of multiple rooms (a.k.a. zones) with a single API method
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @param $zone_id
+     * @param $settings
+     * @return mixed
+     */
+    public function setHomeZoneOverlay($access_token, $zone_id, $settings) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $options['body'] = json_encode($settings);
+        $options['headers']['content-type'] = 'application/json';
+
+        $request = $provider->getAuthenticatedRequest(
+                      ($this->getGenerationX($access_token)  ? 'POST'
+                                                            : 'PUT'),
+                      ($this->getGenerationX($access_token)  ? 'https://hops.tado.com/homes/' . $home_id . '/rooms/' . $zone_id . '/manualControl'
+                                                            : 'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay'),
+                      $access_token,
+                      $options);
+
+        $response = $provider->getParsedResponse($request);
+
+        if (!isset($response['errors'])) return TRUE;
+        return $response;
+    }
+
+
+    /**
+     * Delete the zone overlay
+     *
+     * supported by:   [X] Tado
+     *                 [X] Tado-X
+     *
+     * @param $access_token
+     * @param $zone_id
+     * @return mixed
+     */
+    public function deleteHomeZoneOverlay($access_token, $zone_id) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId($access_token);
+
+        $request = $provider->getAuthenticatedRequest(
+                      ($this->getGenerationX($access_token)  ? 'POST'
+                                                            : 'DELETE'),
+                      ($this->getGenerationX($access_token)  ? 'https://hops.tado.com/homes/' . $home_id . '/rooms/' . $zone_id . '/resumeSchedule'
+                                                            : 'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay'),
+                      $access_token);
+        $response = $provider->getParsedResponse($request);
+
+         if (!isset($response['errors'])) return TRUE;
+        return $response;
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------------------------------------
+    // already started refactoring but not yet done....
+
+    /**
+     * @param $access_token
+     * @param $zone_id
+     * @return mixed
+     */
+    public function getHomeZoneOverlay($access_token, $zone_id) {
+        $provider = $this->getProvider();
+        $home_id = $this->getHomeId();
+/*
+        $request = $provider->getAuthenticatedRequest(
+            'GET',
+            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay',
+            $access_token
+        );
+*/
+// @todo
+die ('has to be extracted of homeZoneState / manualControlTermination');
+
+        $response = $provider->getParsedResponse($request);
+        return $response;
+    }
+
+    /**
+     * setting details of home (?)
+     * got only a 403 forbidden response
+     *
+     * should be supported by: Tado & Tado-X
+     *
      * @param $access_token
      * @param $settings
      * @return mixed
@@ -173,64 +450,14 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
-    /**
-     * @param $access_token
-     * @return mixed
-     */
-    public function getHomeWeather($access_token) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
 
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/weather/',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
-
-    /**
-     * @param $access_token
-     * @return mixed
-     */
-    public function getHomeDevices($access_token) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/devices/',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
-
-    /**
-     * @param $access_token
-     * @return mixed
-     */
-    public function getHomeInstallations($access_token) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/installations/',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
+    // -----------------------------------------------------------------------------------------------------------------------------------------------
+    // refactoring not started....
+    // except for removing direct usage of guzzle
 
     /**
      * @param $access_token
@@ -245,9 +472,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/users/',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -263,9 +489,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/mobileDevices/',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -282,9 +507,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/mobileDevices/' . $device_id,
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
 
@@ -302,9 +526,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/mobileDevices/' . $device_id . '/settings',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -326,47 +549,10 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
-    /**
-     * @param $access_token
-     * @return mixed
-     */
-    public function getHomeZones($access_token) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
-
-    /**
-     * @param $access_token
-     * @param $zone_id
-     * @return mixed
-     */
-    public function getHomeZoneState($access_token, $zone_id) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/state',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
 
     /**
     * @param $access_token
@@ -381,9 +567,8 @@ class Restado {
            'https://my.tado.com/api/v2/homes/' . $home_id . '/zoneStates',
            $access_token
        );
-       $client = new \GuzzleHttp\Client();
-       $response = $client->send($request);
-       return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
    }
 
     /**
@@ -401,9 +586,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/dayReport?date=' . $date,
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -420,9 +604,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/capabilities',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -439,9 +622,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/earlyStart',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -463,73 +645,11 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
 
-    /**
-     * @param $access_token
-     * @param $zone_id
-     * @return mixed
-     */
-    public function getHomeZoneOverlay($access_token, $zone_id) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'GET',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
-
-    /**
-     * @param $access_token
-     * @param $zone_id
-     * @param $settings
-     * @return mixed
-     */
-    public function setHomeZoneOverlay($access_token, $zone_id, $settings) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $options['body'] = json_encode($settings);
-        $options['headers']['content-type'] = 'application/json';
-
-        $request = $provider->getAuthenticatedRequest(
-            'PUT',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay',
-            $access_token,
-            $options
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
-
-    /**
-     * @param $access_token
-     * @param $zone_id
-     * @return mixed
-     */
-    public function deleteHomeZoneOverlay($access_token, $zone_id) {
-        $provider = $this->getProvider();
-        $home_id = $this->getHomeId($access_token);
-
-        $request = $provider->getAuthenticatedRequest(
-            'DELETE',
-            'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/overlay',
-            $access_token
-        );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
-    }
 
     /**
      * @param $access_token
@@ -545,9 +665,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/schedule/activeTimetable',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -569,9 +688,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -588,9 +706,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/schedule/awayConfiguration',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -612,9 +729,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -633,9 +749,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/zones/' . $zone_id . '/schedule/timetables/' . $timetableid . '/blocks' . (!is_null($daypattern) ? ('/' . $daypattern) : ''),
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -659,9 +774,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -676,9 +790,8 @@ class Restado {
             'https://my.tado.com/mobile/1.9/getAppUsersRelativePositions',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -694,9 +807,10 @@ class Restado {
             'https://my.tado.com/api/v2/devices/' .  $device_id . '/identify',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return $response->getStatusCode() == 200;
+
+        // @todo: old: return $response->getStatusCode() == 200;
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -712,9 +826,8 @@ class Restado {
             'https://my.tado.com/api/v2/devices/' .  $device_id . '/temperatureOffset',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -735,9 +848,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -759,9 +871,9 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return $response->getStatusCode() == 200;
+        // @todo: return $response->getStatusCode() == 200;
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -783,9 +895,9 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return $response->getStatusCode() == 200;
+        // @todo: old: return $response->getStatusCode() == 200;
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -827,9 +939,8 @@ class Restado {
             'https://my.tado.com/api/v2/homes/' . $home_id . '/state',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -850,9 +961,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -868,9 +978,8 @@ class Restado {
             'https://energy-insights.tado.com/api/homes/' .  $home_id . '/consumption',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -886,9 +995,8 @@ class Restado {
             'https://energy-insights.tado.com/api/homes/' .  $home_id . '/meterReadings',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -904,9 +1012,8 @@ class Restado {
             'https://energy-insights.tado.com/api/homes/' .  $home_id . '/tariff',
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -927,9 +1034,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
      }
 
     /**
@@ -950,9 +1056,8 @@ class Restado {
             $access_token,
             $options
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -969,9 +1074,8 @@ class Restado {
             'https://energy-insights.tado.com/api/homes/' .  $home_id . '/meterReadings/' . $reading_id,
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
     /**
@@ -990,32 +1094,8 @@ class Restado {
             'https://energy-bob.tado.com/' .  $home_id . '/' . $year . '-' . $month . '?country=' . $country_code,
             $access_token
         );
-        $client = new \GuzzleHttp\Client();
-        $response = $client->send($request);
-        return json_decode($response->getBody());
+        $response = $provider->getParsedResponse($request);
+        return $response;
     }
 
-    /**
-     * @return GenericProvider
-     */
-    private function getProvider() {
-
-        if (config('tado.timeout') !== NULL) {
-          $timeout = config('tado.timeout');
-        } else {
-          // set a timeout based on PHP max_execution_time if not configured
-          // in case of an invalid max_execution_time (empty or FALSE) a default of 20s is being set
-          // in case of an valid max_execution_time the timeout is being set to 90% of this value with a maximum of 20s
-          $timeout = floor((int)ini_get('max_execution_time') * 0.9);
-          if (($timeout>20) or ($timeout<=0)) $timeout = 20;
-        }
-
-        return new GenericProvider([
-            'clientId'                => config('tado.clientId'),    // The client ID assigned to you by the provider
-            'urlAuthorize'            => 'https://login.tado.com/oauth2/device_authorize',
-            'urlAccessToken'          => 'https://login.tado.com/oauth2/token',
-            'urlResourceOwnerDetails' => null,
-            'timeout'                 => $timeout,
-        ]);
-    }
 }
